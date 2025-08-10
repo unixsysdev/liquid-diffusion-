@@ -1,7 +1,28 @@
 # **Improved Liquid Diffusion Model**
 
+
+## Why this isn't a great idea:
+*1. Fundamental Architecture Mismatch
+
+- Diffusion models need spatial inductive biases (convolutions, attention)
+- LNNs are designed for temporal sequences, not 2D spatial data
+- Forcing a temporal tool into a spatial problem
+
+*2. Computational Inefficiency
+
+- Each "liquid cell" does 3-7 integration steps = 3-7× more compute
+- Standard ResNet block: 1 forward pass
+- This liquid block: 5+ forward passes for same capacity
+- Terrible FLOPS/quality ratio
+
+*3. No Real Benefits
+
+- Adaptive time constants don't help with images
+- ODE integration adds complexity without clear gains
+- Standard convolutions already capture spatial hierarchies better
+
 ## **What This Is**
-A significantly enhanced diffusion model that replaces standard U-Net architectures with ODE-inspired liquid neural network blocks. Features adaptive time constants, multi-scale spatial processing, and proper training optimizations for better image generation quality.
+A diffusion model that replaces standard U-Net architectures with ODE-inspired liquid neural network blocks. Features adaptive time constants, multi-scale spatial processing, and proper training optimizations for better image generation quality.
 
 ## **Files**
 * `improved_liquid_diffusion.py` - Complete enhanced implementation with EMA and mixed precision
@@ -37,8 +58,6 @@ A significantly enhanced diffusion model that replaces standard U-Net architectu
 * **Preserves spatial detail** while adding liquid dynamics
 * **Time embedding**: Sinusoidal positional encoding with 4-layer MLP
 * **Group normalization** (8 groups) for stability
-
-## **Training Improvements**
 
 ### **Reproducibility & Stability**
 * **Deterministic seeding** before dataset creation
@@ -121,28 +140,9 @@ This is an **educational implementation** that demonstrates ODE-flavored dynamic
 * Neuromorphic computing optimizations
 * Causal time-series processing
 
-### **For Production Use**
-Consider embedding liquid cells in:
-* **Proper U-Net architectures** with skip connections
-* **Attention mechanisms** for global dependencies  
-* **Progressive training** strategies
-* **Larger model capacities** (>10M parameters)
-
 ## **Future Improvements**
 * **4th-order Runge-Kutta** integration
 * **Learned ODE solvers** (Neural ODE approach)
 * **Sparse connectivity patterns** (true LNN style)
 * **Multi-resolution training** (progressive growing)
-* **Classifier-free guidance** for conditional generation
-
-## **Citation**
-```bibtex
-@misc{liquid_diffusion_2025,
-  title={Improved Liquid Diffusion: ODE-Inspired Generative Models},
-  author={Educational Implementation},
-  year={2025},
-  note={Toy model demonstrating continuous-time dynamics in diffusion}
-}
-```
-
-**What it demonstrates**: Continuous-time ODE dynamics can work effectively in diffusion models, with proper spatial processing and training techniques yielding significant quality improvements over basic implementations.
+* **Classifier-free guidance** for conditional generation  
