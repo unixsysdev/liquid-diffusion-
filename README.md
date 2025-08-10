@@ -1,23 +1,37 @@
-# Liquid Neural Network Diffusion
+# ODE-Inspired Diffusion Model
 
 ## What This Is
 
-Implementation of diffusion models using liquid neural networks (LNNs) for image generation. Tests whether continuous neural dynamics can replace traditional U-Net architectures in diffusion models.
+A toy diffusion model that replaces the standard U-Net with recurrent, ODE-flavored blocks. Uses Euler-integrated dynamics with adaptive time constants for image denoising.
 
 ## Files
 
-- `liquid_diffusion.py` - **TRUE** liquid neural network implementation with ODE dynamics
-- `liquid_diffusion_inspired.py` - CNN-based approach mimicking liquid networks (fake liquid)
+- `liquid_diffusion.py` - ODE-inspired diffusion implementation with recurrent cells
+- `liquid_diffusion_inspired.py` - CNN-based approach (standard convolutions)
 - `train.py` - Training script
 - `data/` - CIFAR-10 dataset (auto-downloaded)
 
-## Key Features (True LNN)
+## Architecture Details
 
-- Continuous ODE dynamics: `τ * dh/dt = -h + activation(...)`
-- Adaptive time constants based on input complexity
-- Multi-step temporal evolution (3-7 Euler integration steps)
-- Recurrent connections with temporal memory
-- 38K parameters vs 500M+ in traditional diffusion models
+**RealLiquidCell**: Recurrent state updated via Euler step:
+```
+τ * dh/dt = -h + tanh(W_rec * h + W_in * x)
+```
+- Input-dependent time constants τ
+- 3-7 integration steps per forward pass
+- Recurrent connections for temporal dynamics
+
+**SpatialLiquidProcessor**: 
+- Global spatial pooling + time embedding
+- Three liquid cells (different step counts)
+- Broadcast back to spatial dimensions
+
+## Limitations
+
+- **Tiny capacity**: Global pooling destroys spatial detail
+- **Basic ODE solver**: Simple Euler integration only
+- **Not true LNN**: Missing sparse gating, proper solvers, biophysical inspiration
+- **Toy quality**: Expect blurry 32x32 images, not production results
 
 ## Quick Start
 
@@ -31,39 +45,17 @@ python train.py
 pip install torch torchvision tqdm matplotlib
 ```
 
-## Architecture
-
-**Traditional Diffusion**: U-Net with discrete operations  
-**This Implementation**: Liquid cells with continuous dynamics
-
-```
-Input → SpatialLiquidProcessor → TrueLiquidDiffusionModel → Denoised Output
-         ↓
-    RealLiquidCell (ODE dynamics)
-    - Global liquid (slow, 3 steps)
-    - Local liquid (medium, 5 steps)  
-    - Detail liquid (fast, 7 steps)
-```
-
 ## Results
 
 - Generates 32x32 CIFAR-10 images
-- ~100x parameter efficiency vs standard diffusion
-- Uses biological-inspired continuous neural dynamics
-- Proof of concept for liquid network image generation
-
-## Training Details
-
-- Dataset: CIFAR-10 (32x32 RGB)
-- Batch size: 8
-- Epochs: 3
-- Timesteps: 400
-- Device: CPU/CUDA
-- Training time: ~10-30 minutes
+- ~38K parameters (vs 500M+ in standard diffusion)
+- Fast training (~10 minutes on CPU)
+- Educational demonstration of ODE dynamics in diffusion
 
 ## Technical Notes
 
-This appears to be one of the first implementations combining liquid neural networks with diffusion models for image generation. The approach replaces traditional U-Net denoising with continuous ODE-based neural dynamics.
+This is **not** a faithful implementation of Liquid Neural Networks from the literature. It's a toy model that uses ODE-flavored recurrent dynamics in place of standard diffusion architectures.
 
-**Real LNN**: `liquid_diffusion.py` - Uses actual continuous dynamics  
-**Fake LNN**: `liquid_diffusion_inspired.py` - CNN mimicking liquid behavior
+**For better results**: Embed liquid cells in a shallow U-Net with proper spatial processing and skip connections.
+
+**What it demonstrates**: Continuous-time dynamics can work in diffusion models, even with basic implementation.
