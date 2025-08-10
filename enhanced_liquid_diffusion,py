@@ -1,0 +1,504 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, Dataset
+import torchvision
+import torchvision.transforms as transforms
+import numpy as np
+import matplotlib.pyplot as plt
+from tqdm import tqdm
+import math
+
+class RealLiquidCell(nn.Module):
+    """
+    Improved Liquid Neural Network cell with better dynamics
+    """
+    def __init__(self, input_size, hidden_size, num_steps=5):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.num_steps = num_steps
+        
+        # Liquid dynamics parameters
+        self.W_rec = nn.Linear(hidden_size, hidden_size, bias=False)
+        self.W_in = nn.Linear(input_size, hidden_size)
+        self.bias = nn.Parameter(torch.zeros(hidden_size))
+        
+        # Improved adaptive time constants
+        self.tau_base = nn.Parameter(torch.ones(hidden_size) * 1.5)
+        self.tau_adapt = nn.Sequential(
+            nn.Linear(input_size, hidden_size // 2),
+            nn.Tanh(),
+            nn.Linear(hidden_size // 2, hidden_size)
+        )
+        
+        # Better initialization
+        nn.init.orthogonal_(self.W_rec.weight, gain=0.8)
+        nn.init.xavier_normal_(self.W_in.weight, gain=1.0)
+        
+    def forward(self, x, dt=0.1):
+        batch_size = x.size(0)
+        device = x.device
+        
+        # Initialize hidden state
+        h = torch.zeros(batch_size, self.hidden_size, device=device)
+        
+        # Compute adaptive time constants
+        tau_adaptation = torch.sigmoid(self.tau_adapt(x))
+        tau = torch.clamp(self.tau_base.unsqueeze(0) * (0.5 + tau_adaptation), 0.1, 5.0)
+        
+        # Improved liquid dynamics with better stability
+        for step in range(self.num_steps):
+            # Recurrent computation
+            recurrent = self.W_rec(h)
+            input_contrib = self.W_in(x)
+            
+            # Add bias and apply activation
+            activation_input = recurrent + input_contrib + self.bias
+            activated = torch.tanh(activation_input)
+            
+            # Liquid ODE with damping for stability
+            dhdt = (-h + activated) / tau
+            
+            # Improved Euler integration with adaptive step size
+            adaptive_dt = dt / (1.0 + 0.1 * torch.norm(dhdt, dim=1, keepdim=True))
+            h = h + adaptive_dt * dhdt
+            
+        return h, tau
+
+class ImprovedSpatialProcessor(nn.Module):
+    """
+    Better spatial processing that preserves more spatial information
+    """
+    def __init__(self, channels, time_emb_dim):
+        super().__init__()
+        self.channels = channels
+        
+        # Multi-scale spatial processing
+        self.global_pool = nn.AdaptiveAvgPool2d(4)  # 4x4 -> channels*16
+        self.local_pool = nn.AdaptiveAvgPool2d(8)   # 8x8 -> channels*64
+        
+        # Fixed: correct input sizes for each scale
+        global_pooled = 4 * 4 * channels  # 16 * channels
+        local_pooled = 8 * 8 * channels   # 64 * channels
+        
+        self.global_liquid = RealLiquidCell(global_pooled + time_emb_dim, channels, num_steps=3)
+        self.local_liquid = RealLiquidCell(local_pooled + time_emb_dim, channels, num_steps=5)
+        self.detail_liquid = RealLiquidCell(channels + time_emb_dim, channels, num_steps=7)
+        
+        # Better fusion
+        self.fusion = nn.Sequential(
+            nn.Linear(channels * 3, channels * 2),
+            nn.SiLU(),
+            nn.Linear(channels * 2, channels)
+        )
+        
+        # Spatial upsampling with learnable weights
+        self.spatial_proj = nn.Conv2d(channels, channels, 3, padding=1)
+        
+    def forward(self, x, time_emb):
+        batch, channels, h, w = x.shape
+        
+        # Multi-scale spatial features
+        global_features = self.global_pool(x).flatten(1)  # [batch, channels*16]
+        local_features = self.local_pool(x).flatten(1)    # [batch, channels*64]
+        detail_features = F.adaptive_avg_pool2d(x, 1).squeeze(-1).squeeze(-1)  # [batch, channels]
+        
+        # Process through liquid networks
+        global_input = torch.cat([global_features, time_emb], dim=-1)
+        local_input = torch.cat([local_features, time_emb], dim=-1)
+        detail_input = torch.cat([detail_features, time_emb], dim=-1)
+        
+        global_out, _ = self.global_liquid(global_input)
+        local_out, _ = self.local_liquid(local_input)
+        detail_out, _ = self.detail_liquid(detail_input)
+        
+        # Fuse multi-scale outputs
+        fused = torch.cat([global_out, local_out, detail_out], dim=-1)
+        output = self.fusion(fused)  # [batch, channels]
+        
+        # Broadcast to spatial dimensions with learned projection
+        output = output.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, h, w)
+        output = self.spatial_proj(output)
+        
+        return output + x  # Residual connection
+
+class ResidualBlock(nn.Module):
+    """
+    Simple residual block for better spatial processing
+    """
+    def __init__(self, channels, time_emb_dim):
+        super().__init__()
+        self.conv1 = nn.Conv2d(channels, channels, 3, padding=1)
+        self.conv2 = nn.Conv2d(channels, channels, 3, padding=1)
+        self.time_proj = nn.Linear(time_emb_dim, channels)
+        self.norm1 = nn.GroupNorm(8, channels)
+        self.norm2 = nn.GroupNorm(8, channels)
+        
+    def forward(self, x, time_emb):
+        residual = x
+        
+        # First conv
+        out = self.norm1(x)
+        out = F.silu(out)
+        out = self.conv1(out)
+        
+        # Add time embedding
+        time_proj = self.time_proj(time_emb).unsqueeze(-1).unsqueeze(-1)
+        out = out + time_proj
+        
+        # Second conv
+        out = self.norm2(out)
+        out = F.silu(out)
+        out = self.conv2(out)
+        
+        return out + residual
+
+class SinusoidalPositionEmbedding(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.dim = dim
+        
+    def forward(self, time):
+        device = time.device
+        half_dim = self.dim // 2
+        embeddings = math.log(10000) / (half_dim - 1)
+        embeddings = torch.exp(torch.arange(half_dim, device=device) * -embeddings)
+        embeddings = time[:, None] * embeddings[None, :]
+        embeddings = torch.cat((embeddings.sin(), embeddings.cos()), dim=-1)
+        return embeddings
+
+class TrueLiquidDiffusionModel(nn.Module):
+    """
+    Improved liquid diffusion model with better spatial processing
+    """
+    def __init__(self, image_channels=3, model_channels=64, num_blocks=3, time_emb_dim=128, num_timesteps=1000):
+        super().__init__()
+        
+        self.image_channels = image_channels
+        self.model_channels = model_channels
+        self.num_timesteps = num_timesteps
+        
+        # Time embedding
+        self.time_embed = SinusoidalPositionEmbedding(time_emb_dim)
+        self.time_mlp = nn.Sequential(
+            nn.Linear(time_emb_dim, time_emb_dim * 4),
+            nn.SiLU(),
+            nn.Linear(time_emb_dim * 4, time_emb_dim),
+            nn.SiLU(),
+            nn.Linear(time_emb_dim, time_emb_dim)
+        )
+        
+        # Input/output projections
+        self.input_proj = nn.Conv2d(image_channels, model_channels, 3, padding=1)
+        self.output_proj = nn.Conv2d(model_channels, image_channels, 3, padding=1)
+        
+        # Improved architecture: mix liquid and residual blocks
+        self.blocks = nn.ModuleList()
+        for i in range(num_blocks):
+            if i % 2 == 0:
+                # Liquid processing blocks
+                self.blocks.append(ImprovedSpatialProcessor(model_channels, time_emb_dim))
+            else:
+                # Regular residual blocks for spatial detail
+                self.blocks.append(ResidualBlock(model_channels, time_emb_dim))
+        
+        # Final normalization
+        self.norm = nn.GroupNorm(8, model_channels)
+        
+        # Better initialization
+        nn.init.zeros_(self.output_proj.weight)
+        nn.init.zeros_(self.output_proj.bias)
+        
+    def forward(self, x, time):
+        # Normalize timesteps to [0, 1] for better frequency coverage
+        t_normalized = time.float() / (self.num_timesteps - 1)
+        time_emb = self.time_embed(t_normalized)
+        time_emb = self.time_mlp(time_emb)
+        
+        # Input projection
+        h = self.input_proj(x)
+        
+        # Process through mixed blocks
+        for block in self.blocks:
+            h = block(h, time_emb)
+        
+        # Final processing
+        h = self.norm(h)
+        h = F.silu(h)
+        noise_pred = self.output_proj(h)
+        
+        return noise_pred
+
+class SimpleDiffusionTrainer:
+    def __init__(self, model, device='cuda', num_timesteps=1000, min_snr_gamma=5.0):
+        self.model = model
+        self.device = device
+        self.num_timesteps = num_timesteps
+        self.min_snr_gamma = min_snr_gamma
+        
+        # Improved noise schedule (cosine)
+        self.beta_start = 0.0001
+        self.beta_end = 0.02
+        
+        # Cosine schedule for better quality
+        timesteps = torch.arange(num_timesteps)
+        alphas_cumprod = torch.cos(((timesteps / num_timesteps) + 0.008) / 1.008 * math.pi / 2) ** 2
+        
+        # Convert to betas
+        alphas_cumprod_prev = F.pad(alphas_cumprod[:-1], (1, 0), value=1.0)
+        self.betas = 1.0 - (alphas_cumprod / alphas_cumprod_prev)
+        self.betas = torch.clamp(self.betas, 0.0001, 0.9999)
+        
+        self.alphas = 1.0 - self.betas
+        self.alphas_cumprod = alphas_cumprod
+        
+        # Move to device
+        self.betas = self.betas.to(device)
+        self.alphas_cumprod = self.alphas_cumprod.to(device)
+        
+    def add_noise(self, x, noise, timesteps):
+        sqrt_alphas_cumprod = torch.sqrt(self.alphas_cumprod[timesteps])
+        sqrt_one_minus_alphas_cumprod = torch.sqrt(1.0 - self.alphas_cumprod[timesteps])
+        
+        sqrt_alphas_cumprod = sqrt_alphas_cumprod.view(-1, 1, 1, 1)
+        sqrt_one_minus_alphas_cumprod = sqrt_one_minus_alphas_cumprod.view(-1, 1, 1, 1)
+        
+        noisy_images = sqrt_alphas_cumprod * x + sqrt_one_minus_alphas_cumprod * noise
+        return noisy_images
+    
+    def training_step(self, batch):
+        images = batch.to(self.device)
+        batch_size = images.shape[0]
+        
+        # Sample timesteps and noise
+        timesteps = torch.randint(0, self.num_timesteps, (batch_size,), device=self.device)
+        noise = torch.randn_like(images)
+        
+        # Add noise
+        noisy_images = self.add_noise(images, noise, timesteps)
+        
+        # Predict noise
+        predicted_noise = self.model(noisy_images, timesteps)
+        
+        # Min-SNR-γ loss weighting
+        snr = self.alphas_cumprod[timesteps] / (1.0 - self.alphas_cumprod[timesteps])
+        weights = torch.minimum(snr, torch.full_like(snr, self.min_snr_gamma))
+        weights = weights / weights.mean()  # Normalize to keep loss scale stable
+        weights = weights.view(-1, 1, 1, 1)
+        
+        loss = F.mse_loss(predicted_noise, noise, reduction='none')
+        loss = (loss * weights).mean()
+        
+        return loss
+    
+    @torch.no_grad()
+    def sample(self, shape, num_steps=50, model=None):
+        if model is None:
+            model = self.model
+        model.eval()
+        
+        # Ensure num_steps doesn't exceed num_timesteps
+        num_steps = min(num_steps, self.num_timesteps)
+        
+        x = torch.randn(shape, device=self.device)
+        step_size = self.num_timesteps // num_steps
+        timesteps = range(self.num_timesteps - 1, 0, -step_size)
+        
+        for t in tqdm(timesteps, desc="Liquid Sampling"):
+            t_tensor = torch.full((shape[0],), t, device=self.device, dtype=torch.long)
+            
+            # Predict noise
+            predicted_noise = model(x, t_tensor)
+            
+            # DDIM update
+            alpha_t = self.alphas_cumprod[t]
+            alpha_t_prev = self.alphas_cumprod[max(0, t - step_size)]
+            
+            pred_x0 = (x - torch.sqrt(1 - alpha_t) * predicted_noise) / torch.sqrt(alpha_t)
+            
+            if t > step_size:
+                x = torch.sqrt(alpha_t_prev) * pred_x0 + torch.sqrt(1 - alpha_t_prev) * predicted_noise
+            else:
+                x = pred_x0
+        
+        model.train()
+        return torch.clamp(x, -1, 1)
+    
+    def save_model(self, filepath, ema_model=None):
+        """Save model weights"""
+        save_dict = {
+            'model_state_dict': self.model.state_dict(),
+            'model_config': {
+                'image_channels': self.model.image_channels,
+                'model_channels': self.model.model_channels,
+                'num_blocks': len(self.model.blocks),
+                'time_emb_dim': self.model.time_mlp[0].in_features,
+                'num_timesteps': self.model.num_timesteps
+            }
+        }
+        
+        if ema_model is not None:
+            save_dict['ema_state_dict'] = ema_model.state_dict()
+        
+        torch.save(save_dict, filepath)
+        print(f"✅ Model saved to {filepath}")
+    
+    def load_model(self, filepath, ema_model=None):
+        """Load model weights"""
+        checkpoint = torch.load(filepath, map_location=self.device)
+        self.model.load_state_dict(checkpoint['model_state_dict'])
+        
+        if ema_model is not None and 'ema_state_dict' in checkpoint:
+            ema_model.load_state_dict(checkpoint['ema_state_dict'])
+            print(f"✅ Model and EMA loaded from {filepath}")
+        else:
+            print(f"✅ Model loaded from {filepath}")
+        
+        return checkpoint.get('model_config', {})
+
+def ema_update(ema_model, model, decay=0.999):
+    """Update EMA model parameters"""
+    with torch.no_grad():
+        for ema_param, param in zip(ema_model.parameters(), model.parameters()):
+            ema_param.data.mul_(decay).add_(param.data, alpha=1.0 - decay)
+
+def train_true_liquid_diffusion():
+    """
+    Train improved liquid neural network diffusion model with EMA and mixed precision
+    """
+    print("🌊 IMPROVED LIQUID DIFFUSION TRAINING")
+    print("=" * 40)
+    
+    # Set seeds for reproducibility BEFORE creating dataset
+    torch.manual_seed(42)
+    np.random.seed(42)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Using device: {device}")
+    
+    # Dataset with reproducible transforms
+    transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
+    ])
+    
+    dataset = torchvision.datasets.CIFAR10(
+        root='./data', train=True, download=True, transform=transform
+    )
+    dataloader = DataLoader(dataset, batch_size=16, shuffle=True, num_workers=2, 
+                          generator=torch.Generator().manual_seed(42))
+    
+    # Improved model
+    model = TrueLiquidDiffusionModel(
+        image_channels=3,
+        model_channels=64,
+        num_blocks=3,
+        time_emb_dim=128,
+        num_timesteps=1000
+    ).to(device)
+    
+    # EMA model for better sampling
+    ema_model = TrueLiquidDiffusionModel(
+        image_channels=3,
+        model_channels=64,
+        num_blocks=3,
+        time_emb_dim=128,
+        num_timesteps=1000
+    ).to(device)
+    ema_model.load_state_dict(model.state_dict())
+    ema_decay = 0.999
+    
+    total_params = sum(p.numel() for p in model.parameters())
+    print(f"Model parameters: {total_params:,}")
+    print("Improvements:")
+    print("✅ Reproducible seeding")
+    print("✅ EMA for better sampling")
+    print("✅ Mixed precision training")
+    print("✅ Min-SNR-γ loss weighting")
+    print("✅ Better spatial processing")
+    print("✅ Cosine noise schedule")
+    print()
+    
+    # Training with mixed precision
+    trainer = SimpleDiffusionTrainer(model, device, num_timesteps=1000, min_snr_gamma=5.0)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=2e-4, weight_decay=0.01)
+    
+    # Mixed precision scaler
+    scaler = torch.cuda.amp.GradScaler(enabled=(device.type == 'cuda'))
+    
+    # Learning rate scheduler
+    total_steps = len(dataloader) * 5  # 5 epochs
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps)
+    
+    print("Starting improved liquid training...")
+    losses = []
+    
+    for epoch in range(5):
+        epoch_losses = []
+        
+        pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}/5")
+        for batch_idx, (batch, _) in enumerate(pbar):
+            optimizer.zero_grad()
+            
+            # Mixed precision training
+            with torch.cuda.amp.autocast(enabled=(device.type == 'cuda')):
+                loss = trainer.training_step(batch)
+            
+            # Scaled backward pass
+            scaler.scale(loss).backward()
+            
+            # Gradient clipping and optimization
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            scaler.step(optimizer)
+            scaler.update()
+            scheduler.step()
+            
+            # Update EMA
+            ema_update(ema_model, model, ema_decay)
+            
+            epoch_losses.append(loss.item())
+            pbar.set_postfix({
+                'loss': f'{loss.item():.4f}',
+                'lr': f'{scheduler.get_last_lr()[0]:.6f}'
+            })
+        
+        avg_loss = np.mean(epoch_losses)
+        losses.append(avg_loss)
+        print(f"Epoch {epoch+1} - Loss: {avg_loss:.4f}")
+    
+    # Save both models
+    trainer.save_model('improved_liquid_diffusion.pth', ema_model)
+    
+    # Generate samples using EMA model
+    print("\nGenerating improved samples with EMA...")
+    with torch.no_grad():
+        samples = trainer.sample((4, 3, 32, 32), num_steps=50, model=ema_model)
+        
+        fig, axes = plt.subplots(2, 2, figsize=(8, 8))
+        for i, ax in enumerate(axes.flat):
+            sample_np = (samples[i].cpu().numpy().transpose(1, 2, 0) + 1) / 2
+            sample_np = np.clip(sample_np, 0, 1)
+            ax.imshow(sample_np)
+            ax.axis('off')
+            ax.set_title(f'EMA Sample {i+1}')
+        
+        plt.tight_layout()
+        plt.suptitle('Improved Liquid Diffusion Model (EMA)', y=1.02)
+        plt.savefig('improved_liquid_samples.png', bbox_inches='tight', dpi=150)
+        plt.show()
+    
+    print("\n✅ Improved Liquid Training Complete!")
+    print("Features added:")
+    print("🎯 Reproducible training")
+    print("🚀 Mixed precision for 2x speed")
+    print("📈 EMA for better sample quality")
+    print("⚖️ Min-SNR-γ loss weighting")
+    
+    return model, ema_model, trainer, losses
+
+# Backward compatibility
+def train_liquid_diffusion():
+    return train_true_liquid_diffusion()
